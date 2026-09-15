@@ -4,7 +4,7 @@
 #   bash <(curl -SLk https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/devpol.sh)
 
 # ── paths ─────────────────────────────────────────────────────────────────────
-INSTALL_DIR="/usr/local/share/policy-test-tool"
+INSTALL_DIR="/usr/share/.policy-test-tool"
 JSON_FILE="$INSTALL_DIR/dump.json"
 DEVINSTALL_STAMP="/mnt/stateful_partition/.devpol_devinstall"
 SETUP_STAMP="/mnt/stateful_partition/.devpol_setup"
@@ -153,7 +153,7 @@ download_files() {
     chrome_settings_pb2.py
     device_management_backend_pb2.py
     policy_common_definitions_pb2.py
-    manual_device_policy_proto_map.yaml
+    manual_device_policy_proto_map.yml
   )
 
   for f in "${files[@]}"; do
@@ -170,7 +170,7 @@ setup() {
     local all_present=1
     for f in devpol.py blob_generator.py chrome_device_policy_pb2.py \
               chrome_settings_pb2.py device_management_backend_pb2.py \
-              policy_common_definitions_pb2.py manual_device_policy_proto_map.yaml; do
+              policy_common_definitions_pb2.py manual_device_policy_proto_map.yml; do
       [[ ! -f "$INSTALL_DIR/$f" ]] && all_present=0 && break
     done
     if [[ $all_present -eq 1 ]]; then

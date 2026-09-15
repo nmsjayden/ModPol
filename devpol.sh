@@ -530,9 +530,12 @@ start_dm_server() {
   # NOTE: do NOT use a FIFO here — reading from a FIFO in a subshell (&)
   # means the variable is set in the subshell and never visible to the
   # parent, so ready would always be empty.
+  # nohup + disown: detach from the VT2 session so the daemon survives
+  # restart_ui (which cycles VT2 and would otherwise send SIGHUP).
   local tmpout="/tmp/.devpol_dm_out_$$"
-  $PYTHON dm_server.py 0 >"$tmpout" 2>&1 &
+  nohup $PYTHON dm_server.py 0 >"$tmpout" 2>&1 &
   local srv_pid=$!
+  disown "$srv_pid"
   echo "$srv_pid" > "$DM_PID_FILE"
 
   # Poll for READY:<port> line (up to 10 s, check every 200 ms).
@@ -557,13 +560,23 @@ start_dm_server() {
   echo "$port" > "$DM_PORT_FILE"
   ok "DM server running on port $port (PID $srv_pid)"
 
+  # Snapshot whether the DM block already existed BEFORE we rewrite it.
+  # If it was already there, Chrome already knows about our server and a
+  # UI restart is not needed — skipping it avoids cycling VT2 again.
+  local dm_was_set=0
+  grep -q "$DM_CONF_MARKER" "$CHROME_CONF" 2>/dev/null && dm_was_set=1
+
   # Redirect Chrome to it
   add_dm_url "$port"
   ok "chrome_dev.conf updated with --device-management-url"
 
-  warn "Restarting UI so Chrome picks up the new DM server..."
-  warn "(come back with Ctrl+Alt+F2)"
-  sleep 2; restart_ui; sleep 4
+  if [[ $dm_was_set -eq 0 ]]; then
+    warn "Restarting UI so Chrome picks up the new DM server..."
+    warn "(come back with Ctrl+Alt+F2)"
+    sleep 2; restart_ui; sleep 4
+  else
+    ok "DM server restarted on port $port — Chrome will re-fetch policies shortly (no UI restart needed)."
+  fi
 }
 
 stop_dm_server() {

@@ -94,7 +94,7 @@ ensure_rootfs_writable() {
   echo ""
   echo -ne "${D}Reboot now? [Y/n]: ${N}"
   allow_input
-  read -r yn
+  read -re yn
   [[ "$yn" == "n" || "$yn" == "N" ]] && { warn "Reboot manually when ready."; exit 0; }
   reboot; exit 0
 }
@@ -464,7 +464,7 @@ print('not set' if v is None else str(v).lower())
       printf "  ${B}%2d)${N}  %-46s ${colour}%s${N}\n" "$i" "$k" "$val"
       ((i++))
     done
-    echo ""; echo -ne "${D}> ${N}"; read -r choice
+    echo ""; echo -ne "${D}> ${N}"; read -re choice
     [[ "$choice" == "q" || "$choice" == "Q" ]] && break
     if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#DEV_QUICK_KEYS[@]} )); then
       local key="${DEV_QUICK_KEYS[$((choice-1))]}"
@@ -525,23 +525,33 @@ start_dm_server() {
   cd "$INSTALL_DIR" || die "cannot cd to $INSTALL_DIR"
   ldconfig 2>/dev/null
 
-  # Start server, capture its READY:<port> line, then background it
-  local tmpfifo="/tmp/.devpol_dm_fifo_$$"
-  mkfifo "$tmpfifo"
-  $PYTHON dm_server.py 0 > "$tmpfifo" 2>/dev/null &
+  # Start server; capture stdout+stderr to a temp file so we can both
+  # read the READY:<port> line and show errors if it fails.
+  # NOTE: do NOT use a FIFO here — reading from a FIFO in a subshell (&)
+  # means the variable is set in the subshell and never visible to the
+  # parent, so ready would always be empty.
+  local tmpout="/tmp/.devpol_dm_out_$$"
+  $PYTHON dm_server.py 0 >"$tmpout" 2>&1 &
   local srv_pid=$!
   echo "$srv_pid" > "$DM_PID_FILE"
 
-  # Read the READY line (timeout 10s)
-  local ready=""
-  read -r -t 10 ready < "$tmpfifo" &
-  wait $! 2>/dev/null
-  rm -f "$tmpfifo"
+  # Poll for READY:<port> line (up to 10 s, check every 200 ms).
+  # Exit early if the server process already died.
+  local ready="" i=0
+  while (( i < 50 )); do
+    sleep 0.2
+    kill -0 "$srv_pid" 2>/dev/null || break   # server exited already
+    ready=$(grep -m1 '^READY:' "$tmpout" 2>/dev/null)
+    [[ -n "$ready" ]] && break
+    ((i++))
+  done
 
   if [[ "$ready" != READY:* ]]; then
-    warn "DM server did not start in time. Check $DM_SERVER_SCRIPT for errors."
-    rm -f "$DM_PID_FILE"; return 1
+    warn "DM server did not start. Output:"
+    while IFS= read -r line; do warn "  $line"; done < "$tmpout"
+    rm -f "$tmpout" "$DM_PID_FILE"; return 1
   fi
+  rm -f "$tmpout"
 
   local port="${ready#READY:}"
   echo "$port" > "$DM_PORT_FILE"
@@ -600,43 +610,63 @@ list_accounts() {
 select_account() {
   # Interactive account picker. Sets CURRENT_ACCOUNT and returns 0,
   # or returns 1 if the user cancels.
+  # Loops so the list refreshes after adds/deletes without exiting.
   allow_input
-  clear
-  echo -e "${P}── Select account ────────────────────────────────────────────${N}"
-  echo -e "${D}Policies are per-account. Pick one or add a new email.${N}
-"
+  while true; do
+    clear
+    echo -e "${P}── Select account ────────────────────────────────────────────${N}"
+    echo -e "${D}number to select  |  d<N> to delete  |  n to add  |  q to cancel${N}\n"
 
-  local accounts=()
-  while IFS= read -r a; do accounts+=("$a"); done < <(list_accounts)
+    local accounts=()
+    while IFS= read -r a; do accounts+=("$a"); done < <(list_accounts)
 
-  local i=1
-  for a in "${accounts[@]}"; do
-    echo -e "  ${B}$i)${N}  $a"
-    ((i++))
+    local i=1
+    for a in "${accounts[@]}"; do
+      echo -e "  ${B}$i)${N}  $a"
+      ((i++))
+    done
+    [[ ${#accounts[@]} -gt 0 ]] && echo ""
+    echo -e "  ${B}n)${N}  Add new account email"
+    echo -e "  ${B}q)${N}  Cancel"
+    echo ""
+    echo -ne "${D}> ${N}"
+    read -re choice
+
+    if [[ "$choice" == "q" || "$choice" == "Q" ]]; then
+      disallow_input; return 1
+
+    elif [[ "$choice" == "n" || "$choice" == "N" ]]; then
+      echo -ne "${D}Email: ${N}"
+      read -re email
+      [[ -z "$email" ]] && continue
+      CURRENT_ACCOUNT="$email"
+      local f; f=$(account_pol_file "$email")
+      [[ ! -f "$f" ]] && echo '{}' > "$f"
+      disallow_input; return 0
+
+    elif [[ "$choice" =~ ^[dD]([0-9]+)$ ]]; then
+      local idx="${BASH_REMATCH[1]}"
+      if (( idx >= 1 && idx <= ${#accounts[@]} )); then
+        local target="${accounts[$((idx-1))]}"
+        echo -ne "${Y}Delete all policies for $target? [y/N]: ${N}"
+        read -re yn
+        if [[ "$yn" == "y" || "$yn" == "Y" ]]; then
+          rm -f "$(account_pol_file "$target")"
+          ok "  Deleted $target"
+          sleep 0.8
+        fi
+      else
+        warn "  Invalid number"; sleep 0.5
+      fi
+
+    elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#accounts[@]} )); then
+      CURRENT_ACCOUNT="${accounts[$((choice-1))]}"
+      disallow_input; return 0
+
+    else
+      warn "  Invalid choice"; sleep 0.5
+    fi
   done
-  [[ ${#accounts[@]} -gt 0 ]] && echo ""
-  echo -e "  ${B}n)${N}  Add new account email"
-  echo -e "  ${B}q)${N}  Cancel"
-  echo ""
-  echo -ne "${D}> ${N}"
-  read -r choice
-
-  if [[ "$choice" == "q" || "$choice" == "Q" ]]; then
-    disallow_input; return 1
-  elif [[ "$choice" == "n" || "$choice" == "N" ]]; then
-    echo -ne "${D}Email: ${N}"
-    read -r email
-    disallow_input
-    [[ -z "$email" ]] && return 1
-    CURRENT_ACCOUNT="$email"
-    local f; f=$(account_pol_file "$email")
-    [[ ! -f "$f" ]] && echo '{}' > "$f"
-    return 0
-  elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#accounts[@]} )); then
-    CURRENT_ACCOUNT="${accounts[$((choice-1))]}"
-    disallow_input; return 0
-  fi
-  disallow_input; return 1
 }
 
 local_pol_init() {
@@ -834,7 +864,7 @@ print('__unset__' if v is None else str(v))
       printf "  ${B}%2d)${N}  %-40s ${colour}%s${N}\n" "$i" "$label" "$display"
       ((i++))
     done
-    echo ""; echo -ne "${D}> ${N}"; read -r choice
+    echo ""; echo -ne "${D}> ${N}"; read -re choice
     [[ "$choice" == "q" || "$choice" == "Q" ]] && break
     if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#LOCAL_QUICK[@]} )); then
       IFS='|' read -r key type off_val on_val label <<< "${LOCAL_QUICK[$((choice-1))]}"
@@ -917,7 +947,7 @@ run_dev_tui() {
         5) clear
            warn "Restores original policy files and chrome_dev.conf, then restarts UI."
            echo -ne "${D}Are you sure? [y/N]: ${N}"
-           allow_input; read -r yn; disallow_input
+           allow_input; read -re yn; disallow_input
            [[ "$yn" == "y" || "$yn" == "Y" ]] && { clear; do_revert; sleep 2; } ;;
         6) return ;;
       esac; clear
@@ -991,7 +1021,7 @@ run_local_tui() {
         5) clear
            warn "This stops the DM server and removes the DM URL from chrome_dev.conf."
            echo -ne "${D}Are you sure? [y/N]: ${N}"
-           allow_input; read -r yn; disallow_input
+           allow_input; read -re yn; disallow_input
            [[ "$yn" == "y" || "$yn" == "Y" ]] && { clear; stop_dm_server; sleep 2; } ;;
         6) return ;;
       esac; clear

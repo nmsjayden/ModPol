@@ -129,7 +129,7 @@ setup_chrome_conf() {
 install_deps() {
   if [[ ! -f "$DEVINSTALL_STAMP" ]]; then
     info "Running dev_install to bootstrap emerge (takes a minute)..."
-    printf 'y\n\nn' | dev_install --reinstall \
+    printf 'y\nn\n' | dev_install --reinstall \
       || die "dev_install failed — connect to the internet first"
     touch "$DEVINSTALL_STAMP"
   fi
@@ -166,13 +166,13 @@ download_files() {
 setup() {
   # check files are all present if stamp exists
   if [[ -f "$SETUP_STAMP" ]]; then
-    local ok=1
+    local all_present=1
     for f in devpol.py blob_generator.py chrome_device_policy_pb2.py \
               device_management_backend_pb2.py policy_common_definitions_pb2.py \
               manual_device_policy_proto_map.yaml; do
-      [[ ! -f "$INSTALL_DIR/$f" ]] && ok=0 && break
+      [[ ! -f "$INSTALL_DIR/$f" ]] && all_present=0 && break
     done
-    if [[ $ok -eq 1 ]]; then
+    if [[ $all_present -eq 1 ]]; then
       setup_chrome_conf
       return
     fi
@@ -223,7 +223,7 @@ do_apply() {
 # ── revert ────────────────────────────────────────────────────────────────────
 do_revert() {
   local reverted=0
-  pushd "$DEVSET_DIR" > /dev/null
+  pushd "$DEVSET_DIR" > /dev/null || die "cannot access $DEVSET_DIR"
 
   if [[ -f owner.key.bak.enterprise ]]; then
     mv owner.key.bak.enterprise owner.key && reverted=1
@@ -347,7 +347,7 @@ print('none' if v is None else str(v).lower())
 import json
 with open('$JSON_FILE') as f:
     d = json.load(f)
-d.setdefault('device', {})['$key'] = ($new == True or '$new' == 'true')
+d.setdefault('device', {})['$key'] = '$new' == 'true'
 with open('$JSON_FILE', 'w') as f:
     json.dump(d, f, indent=2)
 " && ok "  $key → $new"

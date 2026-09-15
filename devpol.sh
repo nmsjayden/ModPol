@@ -187,33 +187,69 @@ except ImportError as e:
     print(f"Import error: {e}", flush=True)
     sys.exit(1)
 
-POLICY_FILE  = os.path.join(HERE, "user_policies.json")
 FAKE_TOKEN   = "devpol_fake_token"
 POLICY_TYPES = {"google/chromeos/user", "google/chrome/user"}
 
-def load_user_proto():
-    """Read user_policies.json and return a serialized ChromeSettingsProto."""
-    with open(POLICY_FILE) as f:
+def policy_file_for(email):
+    """Return the policy file path for an email, falling back to the default."""
+    if email:
+        specific = os.path.join(HERE, f"user_policies_{email}.json")
+        if os.path.exists(specific):
+            return specific
+    default = os.path.join(HERE, "user_policies.json")
+    return default if os.path.exists(default) else None
+
+def load_user_proto(email):
+    """Load and serialize policies for the given account email."""
+    path = policy_file_for(email)
+    if not path:
+        return chrome_settings_pb2.ChromeSettingsProto().SerializeToString()
+    with open(path) as f:
         policies = json.load(f)
     settings = chrome_settings_pb2.ChromeSettingsProto()
     apply_user_policies(policies, settings)
     return settings.SerializeToString()
 
-def make_policy_data(policy_type, value_bytes):
+def make_policy_data(policy_type, value_bytes, email):
     pd = dm.PolicyData()
     pd.policy_type    = policy_type
     pd.policy_value   = value_bytes
-    pd.request_token  = FAKE_TOKEN
+    pd.request_token  = email or FAKE_TOKEN
+    pd.username       = email
     pd.timestamp      = int(time.time() * 1000)
     return pd.SerializeToString()
 
-def make_fetch_response(policy_type):
-    value_bytes      = load_user_proto()
-    policy_data_raw  = make_policy_data(policy_type, value_bytes)
+def make_fetch_response(policy_type, email):
+    value_bytes     = load_user_proto(email)
+    policy_data_raw = make_policy_data(policy_type, value_bytes, email)
     r = dm.PolicyFetchResponse()
-    r.policy_data    = policy_data_raw
+    r.policy_data   = policy_data_raw
     # Signature intentionally omitted — Chrome has --disable-policy-key-verification
     return r
+
+def resolve_email(params, headers):
+    """Work out which account is making this request.
+
+    Priority order:
+    1. ?username= on the request URL — Chrome includes this on policy fetches
+       even when it skips registration, making it the most reliable signal.
+    2. The DM token in the Authorization header — only present if Chrome did
+       register with us first and we stored the email as the token.
+    3. Empty string → caller falls back to the default policy file.
+    """
+    # 1. URL query param (present on sign-in fetches even without registration)
+    username = params.get("username", [""])[0]
+    if "@" in username:
+        return username
+
+    # 2. DM token we issued during registration
+    auth = headers.get("Authorization", "")
+    if "token=" in auth:
+        token = auth.split("token=", 1)[-1].strip()
+        if "@" in token:
+            return token
+
+    return ""
 
 class DMHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -223,16 +259,21 @@ class DMHandler(http.server.BaseHTTPRequestHandler):
             self._reply(404, b'', 'text/plain')
 
     def do_POST(self):
-        params       = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-        req_type     = params.get('request', [''])[0]
-        length       = int(self.headers.get('Content-Length', 0))
-        body         = self.rfile.read(length)
-        dm_resp      = dm.DeviceManagementResponse()
+        params   = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        req_type = params.get('request', [''])[0]
+        length   = int(self.headers.get('Content-Length', 0))
+        body     = self.rfile.read(length)
+        dm_resp  = dm.DeviceManagementResponse()
 
         if req_type in ('register_device', 'register_browser'):
-            dm_resp.register_response.device_management_token = FAKE_TOKEN
+            # Use the account email as the token so we can identify the user
+            # on subsequent policy fetches from the Authorization header.
+            email = params.get('username', [''])[0]
+            token = email if email else FAKE_TOKEN
+            dm_resp.register_response.device_management_token = token
 
         elif req_type == 'policy':
+            email = resolve_email(params, self.headers)
             req = dm.DeviceManagementRequest()
             try:
                 req.ParseFromString(body)
@@ -242,9 +283,9 @@ class DMHandler(http.server.BaseHTTPRequestHandler):
                 if fetch_req.policy_type in POLICY_TYPES:
                     try:
                         r = dm_resp.policy_response.responses.add()
-                        r.CopyFrom(make_fetch_response(fetch_req.policy_type))
+                        r.CopyFrom(make_fetch_response(fetch_req.policy_type, email))
                     except Exception as e:
-                        print(f"Policy build error: {e}", flush=True)
+                        print(f"Policy build error ({email}): {e}", flush=True)
         # All other request types get an empty response (status_upload, etc.)
 
         data = dm_resp.SerializeToString()
@@ -509,32 +550,227 @@ stop_dm_server() {
   sleep 1; restart_ui
 }
 
+# ── per-account policy file helpers ──────────────────────────────────────────
+# Policy files are named user_policies_<email>.json for per-account policies,
+# or user_policies.json as a default for all accounts.
+# CURRENT_ACCOUNT holds the selected email for the current TUI session.
+
+CURRENT_ACCOUNT=""
+
+account_pol_file() {
+  # Return the policy file path for a given email (arg 1), or CURRENT_ACCOUNT
+  local email="${1:-$CURRENT_ACCOUNT}"
+  if [[ -n "$email" ]]; then
+    echo "$INSTALL_DIR/user_policies_${email}.json"
+  else
+    echo "$USER_POL_FILE"
+  fi
+}
+
+list_accounts() {
+  # Print each email that has a per-account policy file
+  for f in "$INSTALL_DIR"/user_policies_*.json; do
+    [[ -f "$f" ]] || continue
+    local name="${f##*/user_policies_}"
+    name="${name%.json}"
+    echo "$name"
+  done
+}
+
+select_account() {
+  # Interactive account picker. Sets CURRENT_ACCOUNT and returns 0,
+  # or returns 1 if the user cancels.
+  allow_input
+  clear
+  echo -e "${P}── Select account ────────────────────────────────────────────${N}"
+  echo -e "${D}Policies are per-account. Pick one or add a new email.${N}
+"
+
+  local accounts=()
+  while IFS= read -r a; do accounts+=("$a"); done < <(list_accounts)
+
+  local i=1
+  for a in "${accounts[@]}"; do
+    echo -e "  ${B}$i)${N}  $a"
+    ((i++))
+  done
+  [[ ${#accounts[@]} -gt 0 ]] && echo ""
+  echo -e "  ${B}n)${N}  Add new account email"
+  echo -e "  ${B}q)${N}  Cancel"
+  echo ""
+  echo -ne "${D}> ${N}"
+  read -r choice
+
+  if [[ "$choice" == "q" || "$choice" == "Q" ]]; then
+    disallow_input; return 1
+  elif [[ "$choice" == "n" || "$choice" == "N" ]]; then
+    echo -ne "${D}Email: ${N}"
+    read -r email
+    disallow_input
+    [[ -z "$email" ]] && return 1
+    CURRENT_ACCOUNT="$email"
+    local f; f=$(account_pol_file "$email")
+    [[ ! -f "$f" ]] && echo '{}' > "$f"
+    return 0
+  elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#accounts[@]} )); then
+    CURRENT_ACCOUNT="${accounts[$((choice-1))]}"
+    disallow_input; return 0
+  fi
+  disallow_input; return 1
+}
+
 local_pol_init() {
-  [[ ! -f "$USER_POL_FILE" ]] && echo '{}' > "$USER_POL_FILE"
+  local f; f=$(account_pol_file)
+  [[ ! -f "$f" ]] && echo '{}' > "$f"
 }
 
 do_local_edit() {
   local_pol_init
+  local f; f=$(account_pol_file)
   local ed; ed=$(command -v nano || command -v vi || command -v vim)
   [[ -z "$ed" ]] && die "no editor found"
-  allow_input; "$ed" "$USER_POL_FILE"; disallow_input
+  allow_input; "$ed" "$f"; disallow_input
 }
 
 do_local_show() {
-  if [[ ! -f "$USER_POL_FILE" ]]; then
+  local f; f=$(account_pol_file)
+  if [[ ! -f "$f" ]]; then
     warn "No policy file yet."; sleep 1; return
   fi
   allow_input
-  echo -e "\n${P}── user policies ($USER_POL_FILE) ───────────────────────${N}\n"
+  echo -e "\n${P}── user policies: ${CURRENT_ACCOUNT:-default} ─────────────────────${N}\n"
   $PYTHON -c "
-import json
-d = json.load(open('$USER_POL_FILE'))
+import json, sys
+f = sys.argv[1]
+d = json.load(open(f))
 if not d:
     print('  (empty)')
 for k, v in sorted(d.items()):
     print(f'  {k}: {v}')
-"
+" "$f"
   echo -e "\n${D}Press Enter...${N}"; read -r; disallow_input
+}
+
+# ── import from chrome://policy export ───────────────────────────────────────
+# User goes to chrome://policy → Export to JSON → saves as policy_export.json
+# to Downloads. We find it, extract user-scoped policies, write user_policies.json.
+
+EXPORT_FILENAME="policy_export.json"
+EXPORT_SEARCH=(
+  "/home/chronos/user/Downloads"
+  "/home/chronos/user/MyFiles/Downloads"
+  "/home/chronos/user/MyFiles"
+  "/home/chronos/user"
+)
+
+find_policy_export() {
+  for dir in "${EXPORT_SEARCH[@]}"; do
+    [[ -f "$dir/$EXPORT_FILENAME" ]] && echo "$dir/$EXPORT_FILENAME" && return
+  done
+}
+
+do_local_import() {
+  local upf; upf=$(account_pol_file)
+  allow_input
+  clear
+  echo -e "${P}── Import for: ${CURRENT_ACCOUNT:-default} ───────────────────────────────${N}\n"
+
+  local export_file
+  export_file=$(find_policy_export)
+
+  if [[ -z "$export_file" ]]; then
+    warn "No export file found (looking for '$EXPORT_FILENAME' in Downloads)."
+    echo ""
+    info "How to export:"
+    echo "  1. Open the browser and go to chrome://policy"
+    echo "  2. Click the 'Export to JSON' button at the top"
+    echo "  3. Save the file as:  policy_export.json"
+    echo "  4. Save it to your Downloads folder"
+    echo "  5. Come back to VT2 (Ctrl+Alt+F2) and try again"
+    echo ""
+    echo -e "${D}Press Enter...${N}"
+    read -r; disallow_input; return
+  fi
+
+  info "Found: $export_file"
+  echo ""
+
+  local result
+  result=$($PYTHON - "$export_file" "$upf" << 'PYEOF'
+import json, sys
+
+export_path, out_path = sys.argv[1], sys.argv[2]
+
+with open(export_path) as f:
+    export = json.load(f)
+
+user_policies = {}
+
+# Format 1: newer Chrome — top-level keys are policy names
+# { "PolicyName": { "value": ..., "scope": "User", ... }, ... }
+# Sometimes wrapped under "chromePolicies"
+def extract_from_flat(d):
+    out = {}
+    for name, info in d.items():
+        if not isinstance(info, dict):
+            continue
+        scope = info.get('scope', '')
+        if scope in ('User', 'user') and 'value' in info:
+            out[name] = info['value']
+    return out
+
+if 'chromePolicies' in export:
+    user_policies = extract_from_flat(export['chromePolicies'])
+
+elif 'policyValues' in export:
+    # Format 2: older Chrome — nested under policyValues.chrome.policies
+    chrome = export['policyValues'].get('chrome', {})
+    user_policies = extract_from_flat(chrome.get('policies', {}))
+
+else:
+    # Format 3: flat dict at top level (some versions)
+    user_policies = extract_from_flat(export)
+
+if not user_policies:
+    # Last resort: grab everything with a value field regardless of scope
+    def extract_all(d):
+        out = {}
+        for name, info in d.items():
+            if isinstance(info, dict) and 'value' in info:
+                out[name] = info['value']
+        return out
+    if 'chromePolicies' in export:
+        user_policies = extract_all(export['chromePolicies'])
+    elif 'policyValues' in export:
+        chrome = export['policyValues'].get('chrome', {})
+        user_policies = extract_all(chrome.get('policies', {}))
+    else:
+        user_policies = extract_all(export)
+    if user_policies:
+        print(f"WARNING: no user-scoped policies found; imported all {len(user_policies)} policies")
+
+with open(out_path, 'w') as f:
+    json.dump(user_policies, f, indent=2)
+
+print(f"OK:{len(user_policies)}")
+PYEOF
+)
+
+  if [[ "$result" == OK:* ]]; then
+    local count="${result#OK:}"
+    ok "Imported $count policies → $USER_POL_FILE"
+    [[ "$count" -eq 0 ]] && warn "File is empty — the export may have had no user policies."
+  elif [[ "$result" == WARNING:* ]]; then
+    warn "$result"
+    warn "Review the file before applying."
+  else
+    warn "Import failed. The export file may be in an unexpected format."
+    warn "Try editing user_policies.json manually instead."
+  fi
+
+  echo ""
+  echo -e "${D}Press Enter...${N}"
+  read -r; disallow_input
 }
 
 # Quick-toggle table. Format: "KEY|TYPE|OFF_VAL|ON_VAL|LABEL"
@@ -555,16 +791,17 @@ LOCAL_QUICK=(
 
 do_local_quick() {
   local_pol_init
+  local upf; upf=$(account_pol_file)
   allow_input; clear
   while true; do
-    echo -e "${P}── user policy quick toggle ──────────────────────────────────${N}"
+    echo -e "${P}── user policy quick toggle: ${CURRENT_ACCOUNT:-default} ─────────────${N}"
     echo -e "${D}number to toggle  |  q to go back${N}\n"
     local i=1
     for entry in "${LOCAL_QUICK[@]}"; do
       IFS='|' read -r key type off_val on_val label <<< "$entry"
       local raw
       raw=$($PYTHON -c "
-import json; d=json.load(open('$USER_POL_FILE'))
+import json; d=json.load(open('$upf'))
 v=d.get('$key',None)
 print('__unset__' if v is None else str(v))
 " 2>/dev/null)
@@ -583,7 +820,7 @@ print('__unset__' if v is None else str(v))
       IFS='|' read -r key type off_val on_val label <<< "${LOCAL_QUICK[$((choice-1))]}"
       local cur
       cur=$($PYTHON -c "
-import json; d=json.load(open('$USER_POL_FILE'))
+import json; d=json.load(open('$upf'))
 print('__unset__' if d.get('$key') is None else str(d['$key']))
 " 2>/dev/null)
       if [[ "$type" == "bool" ]]; then
@@ -591,18 +828,18 @@ print('__unset__' if d.get('$key') is None else str(d['$key']))
         [[ "$cur" == "True" ]] && new="false"
         $PYTHON -c "
 import json
-with open('$USER_POL_FILE') as f: d=json.load(f)
+with open('$upf') as f: d=json.load(f)
 d['$key']='$new'=='true'
-with open('$USER_POL_FILE','w') as f: json.dump(d,f,indent=2)
+with open('$upf','w') as f: json.dump(d,f,indent=2)
 " && ok "  $label → $new"
       else
         local new="$on_val"
         [[ "$cur" == "$on_val" ]] && new="$off_val"
         $PYTHON -c "
 import json
-with open('$USER_POL_FILE') as f: d=json.load(f)
+with open('$upf') as f: d=json.load(f)
 d['$key']=$new
-with open('$USER_POL_FILE','w') as f: json.dump(d,f,indent=2)
+with open('$upf','w') as f: json.dump(d,f,indent=2)
 " && ok "  $label → $new"
       fi
       sleep 0.5
@@ -670,17 +907,24 @@ run_dev_tui() {
 
 # ── local account (user) policy submenu ──────────────────────────────────────
 LOCAL_MENU=(
-  "1)  Quick toggle"
-  "2)  Full editor (nano)"
-  "3)  Show current policies"
-  "4)  Start / restart DM server + apply"
-  "5)  Stop DM server"
-  "6)  Back"
+  "1)  Import from chrome://policy export"
+  "2)  Quick toggle"
+  "3)  Full editor (nano)"
+  "4)  Show current policies"
+  "5)  Start / restart DM server + apply"
+  "6)  Stop DM server"
+  "7)  Back"
 )
 
 run_local_tui() {
-  local sel=0 n=${#LOCAL_MENU[@]}; clear
+  # Always start with account selection so the user picks which account
+  # they are editing before any action is taken.
+  select_account || return
+  clear
+
+  local sel=0 n=${#LOCAL_MENU[@]}
   while true; do
+    local upf; upf=$(account_pol_file)
     tput cup 0 0
     echo -e "${P}┌───────────────────────────────────────────────┐${N}"
     echo -e "${P}│        Local Account Policy Editor            │${N}"
@@ -697,35 +941,39 @@ run_local_tui() {
     else
       echo -e "    ${D}○ DM server not running${N}"
     fi
-    if [[ -f "$USER_POL_FILE" ]]; then
-      local count; count=$($PYTHON -c "import json;d=json.load(open('$USER_POL_FILE'));print(len(d))" 2>/dev/null || echo "?")
-      echo -e "    ${D}$USER_POL_FILE  ($count policies set)${N}"
+    # Show current account and its policy count
+    echo -e "    ${B}Account: ${CURRENT_ACCOUNT:-default}${N}"
+    if [[ -f "$upf" ]]; then
+      local count; count=$($PYTHON -c "import json;d=json.load(open('$upf'));print(len(d))" 2>/dev/null || echo "?")
+      echo -e "    ${D}$upf  ($count policies set)${N}"
     else
-      echo -e "    ${D}no policy file — Quick Toggle or Edit will create it${N}"
+      echo -e "    ${D}no policy file yet${N}"
     fi
     tput ed
     read -rsn1 key
     if [[ "$key" == $'\x1b' ]]; then
       read -rsn2 -t 0.05 seq; while read -rsn1 -t 0.01 _; do :; done
       case "$seq" in '[A') sel=$(( (sel-1+n)%n ));; '[B') sel=$(( (sel+1)%n ));; esac
-    elif [[ "$key" =~ ^[1-6]$ ]]; then sel=$(( key-1 ))
+    elif [[ "$key" =~ ^[1-7]$ ]]; then sel=$(( key-1 ))
     elif [[ "$key" == "" ]]; then
       case $sel in
-        0) clear; do_local_quick ;;
-        1) do_local_edit ;;
-        2) do_local_show ;;
-        3) clear
-           info "Validating policy file..."
-           $PYTHON -c "import json; json.load(open('$USER_POL_FILE'))" 2>/dev/null \
-             || { warn "Invalid JSON in $USER_POL_FILE — fix it first."; echo -e "${D}Press Enter...${N}"; read -r; clear; continue; }
+        0) do_local_import ;;
+        1) clear; do_local_quick ;;
+        2) do_local_edit ;;
+        3) do_local_show ;;
+        4) clear
+           local upf2; upf2=$(account_pol_file)
+           info "Validating $upf2 ..."
+           $PYTHON -c "import json; json.load(open('$upf2'))" 2>/dev/null \
+             || { warn "Invalid JSON — fix it first."; echo -e "${D}Press Enter...${N}"; read -r; clear; continue; }
            start_dm_server
            echo -e "\n${D}Press Enter...${N}"; read -r ;;
-        4) clear
+        5) clear
            warn "This stops the DM server and removes the DM URL from chrome_dev.conf."
            echo -ne "${D}Are you sure? [y/N]: ${N}"
            allow_input; read -r yn; disallow_input
            [[ "$yn" == "y" || "$yn" == "Y" ]] && { clear; stop_dm_server; sleep 2; } ;;
-        5) return ;;
+        6) return ;;
       esac; clear
     fi
   done

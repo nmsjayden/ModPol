@@ -10,6 +10,8 @@ USER_POL_FILE="$INSTALL_DIR/user_policies.json"
 DM_SERVER_SCRIPT="$INSTALL_DIR/dm_server.py"
 DM_PID_FILE="/mnt/stateful_partition/.devpol_dm.pid"
 DM_PORT_FILE="/mnt/stateful_partition/.devpol_dm.port"
+DM_FIXED_PORT=19876          # fixed port — never changes between restarts
+DM_LOG_FILE="/tmp/devpol_dm.log"
 DEVINSTALL_STAMP="/mnt/stateful_partition/.devpol_devinstall"
 SETUP_STAMP="/mnt/stateful_partition/.devpol_setup"
 DEVSET_DIR="/var/lib/devicesettings"
@@ -187,10 +189,21 @@ Serves google/chromeos/user and google/chrome/user policies from
 user_policies.json in the same directory. Designed to work alongside
 --disable-policy-key-verification so signatures are not required.
 """
-import http.server, json, os, sys, time, urllib.parse, socketserver
+import http.server, json, logging, os, sys, time, urllib.parse, socketserver
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+
+# Log every request to a file so problems are diagnosable without
+# cluttering VT2. Check with: cat /tmp/devpol_dm.log
+LOG_FILE = "/tmp/devpol_dm.log"
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("devpol")
 
 try:
     import device_management_backend_pb2 as dm
@@ -198,6 +211,7 @@ try:
     import policy_common_definitions_pb2
     from blob_generator import apply_user_policies
 except ImportError as e:
+    log.error("Import error: %s", e)
     print(f"Import error: {e}", flush=True)
     sys.exit(1)
 
@@ -279,27 +293,40 @@ class DMHandler(http.server.BaseHTTPRequestHandler):
         body     = self.rfile.read(length)
         dm_resp  = dm.DeviceManagementResponse()
 
+        auth_hdr = self.headers.get("Authorization", "")
+        log.info("POST req_type=%r  auth=%r  path=%s", req_type, auth_hdr, self.path)
+
         if req_type in ('register_device', 'register_browser'):
             # Use the account email as the token so we can identify the user
             # on subsequent policy fetches from the Authorization header.
             email = params.get('username', [''])[0]
             token = email if email else FAKE_TOKEN
+            log.info("  register: email=%r → token=%r", email, token)
             dm_resp.register_response.device_management_token = token
 
         elif req_type == 'policy':
             email = resolve_email(params, self.headers)
+            pol_file = policy_file_for(email)
+            log.info("  policy fetch: resolved_email=%r  policy_file=%r", email, pol_file)
             req = dm.DeviceManagementRequest()
             try:
                 req.ParseFromString(body)
             except Exception:
                 pass
             for fetch_req in req.policy_request.requests:
+                log.info("  policy_type requested: %r  (handled=%s)",
+                         fetch_req.policy_type, fetch_req.policy_type in POLICY_TYPES)
                 if fetch_req.policy_type in POLICY_TYPES:
                     try:
                         r = dm_resp.policy_response.responses.add()
                         r.CopyFrom(make_fetch_response(fetch_req.policy_type, email))
+                        log.info("  served %s for %r from %r",
+                                 fetch_req.policy_type, email, pol_file)
                     except Exception as e:
+                        log.error("  Policy build error (%s): %s", email, e)
                         print(f"Policy build error ({email}): {e}", flush=True)
+        else:
+            log.info("  unhandled req_type=%r (empty response)", req_type)
         # All other request types get an empty response (status_upload, etc.)
 
         data = dm_resp.SerializeToString()
@@ -312,8 +339,8 @@ class DMHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def log_message(self, *_):
-        pass  # keep VT2 clean
+    def log_message(self, fmt, *args):
+        log.info("HTTP: " + fmt, *args)
 
 if __name__ == '__main__':
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 0
@@ -521,7 +548,7 @@ start_dm_server() {
 
   [[ ! -f "$USER_POL_FILE" ]] && echo '{}' > "$USER_POL_FILE"
 
-  info "Starting DM server..."
+  info "Starting DM server on fixed port $DM_FIXED_PORT..."
   cd "$INSTALL_DIR" || die "cannot cd to $INSTALL_DIR"
   ldconfig 2>/dev/null
 
@@ -533,7 +560,7 @@ start_dm_server() {
   # nohup + disown: detach from the VT2 session so the daemon survives
   # restart_ui (which cycles VT2 and would otherwise send SIGHUP).
   local tmpout="/tmp/.devpol_dm_out_$$"
-  nohup $PYTHON dm_server.py 0 >"$tmpout" 2>&1 &
+  nohup $PYTHON dm_server.py "$DM_FIXED_PORT" >"$tmpout" 2>&1 &
   local srv_pid=$!
   disown "$srv_pid"
   echo "$srv_pid" > "$DM_PID_FILE"
@@ -556,18 +583,19 @@ start_dm_server() {
   fi
   rm -f "$tmpout"
 
-  local port="${ready#READY:}"
-  echo "$port" > "$DM_PORT_FILE"
-  ok "DM server running on port $port (PID $srv_pid)"
+  # Port is always DM_FIXED_PORT — record it so dm_server_port() still works.
+  echo "$DM_FIXED_PORT" > "$DM_PORT_FILE"
+  ok "DM server running on port $DM_FIXED_PORT (PID $srv_pid)"
 
   # Snapshot whether the DM block already existed BEFORE we rewrite it.
-  # If it was already there, Chrome already knows about our server and a
-  # UI restart is not needed — skipping it avoids cycling VT2 again.
+  # If it was already there, Chrome already knows about our server (same
+  # fixed port) and a UI restart is not needed — skipping it avoids
+  # cycling VT2 again.
   local dm_was_set=0
   grep -q "$DM_CONF_MARKER" "$CHROME_CONF" 2>/dev/null && dm_was_set=1
 
   # Redirect Chrome to it
-  add_dm_url "$port"
+  add_dm_url "$DM_FIXED_PORT"
   ok "chrome_dev.conf updated with --device-management-url"
 
   if [[ $dm_was_set -eq 0 ]]; then
@@ -575,7 +603,8 @@ start_dm_server() {
     warn "(come back with Ctrl+Alt+F2)"
     sleep 2; restart_ui; sleep 4
   else
-    ok "DM server restarted on port $port — Chrome will re-fetch policies shortly (no UI restart needed)."
+    ok "DM server restarted on port $DM_FIXED_PORT — Chrome already points here, no UI restart needed."
+    ok "Reload policies in chrome://policy (or sign out and back in) to fetch fresh policies."
   fi
 }
 
@@ -1085,4 +1114,7 @@ echo -e "${P}devpol — standalone ChromeOS policy editor${N}"
 echo -e "${D}no Modmium required  •  developer mode + root only${N}"
 echo ""
 setup
+# Always regenerate dm_server.py so any changes in this script take effect
+# immediately, without needing to wipe the setup stamp.
+generate_dm_server
 run_tui

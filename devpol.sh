@@ -41,7 +41,7 @@ PYTHON=$(command -v python3 || command -v python)
 # ── find the latest policy blob ───────────────────────────────────────────────
 latest_policy() {
   ls "$DEVSET_DIR"/policy.* 2>/dev/null \
-    | grep -P 'policy\.\d+$' \
+    | grep -E 'policy\.[0-9]+$' \
     | sort -t. -k2 -V \
     | tail -n1
 }

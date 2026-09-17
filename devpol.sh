@@ -54,11 +54,27 @@ command -v python3 &>/dev/null || command -v python &>/dev/null || die "python n
 PYTHON=$(command -v python3 || command -v python)
 
 # ── source sub-scripts ────────────────────────────────────────────────────────
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=devpol_setup.sh
-source "$SCRIPT_DIR/devpol_setup.sh"
-# shellcheck source=devpol_policy.sh
-source "$SCRIPT_DIR/devpol_policy.sh"
+# When run via bash <(curl ...), SCRIPT_DIR is a /dev/fd path and the companion
+# files are missing. Download them on the fly in that case.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || SCRIPT_DIR=""
+REPO_RAW="https://raw.githubusercontent.com/nmsjayden/ModPol/refs/heads/main"
+
+_source_companion() {
+  local name="$1"
+  local path=""
+  if [[ -n "$SCRIPT_DIR" && -f "$SCRIPT_DIR/$name" ]]; then
+    path="$SCRIPT_DIR/$name"
+  else
+    path="/tmp/.devpol_$name"
+    info "Fetching $name..."
+    curl -fSLk "$REPO_RAW/$name" -o "$path" || die "failed to download $name"
+  fi
+  # shellcheck source=/dev/null
+  source "$path"
+}
+
+_source_companion "devpol_setup.sh"
+_source_companion "devpol_policy.sh"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TUI

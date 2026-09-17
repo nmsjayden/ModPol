@@ -150,7 +150,62 @@ with open('$JSON_FILE','w') as f: json.dump(d,f,indent=2)
 #
 # The server stays running in the background (PID in DM_PID_FILE) while
 # the user is active. Chrome re-fetches every ~3h or on sign-in.
+#
+# --disable-policy-key-verification is required so Chrome accepts our
+# self-signed DM responses. However, Chrome calls
+# base::SysInfo::CrashIfChromeOSNonTestImage() when it processes that
+# flag — which aborts if /etc/lsb-release does not contain
+# CHROMEOS_RELEASE_TRACK=testimage-channel. Since the device already has
+# a writable rootfs (devpol prerequisite), we patch that one line before
+# restarting the UI and restore it when stopping the server.
 # ═══════════════════════════════════════════════════════════════════════════════
+
+# Saved original CHROMEOS_RELEASE_TRACK value, written by patch_lsb_release.
+LSB_TRACK_BAK_FILE="$INSTALL_DIR/.lsb_release_track.bak"
+
+# patch_lsb_release — set CHROMEOS_RELEASE_TRACK=testimage-channel so Chrome
+# does not crash when it encounters --disable-policy-key-verification.
+# Saves the original value to LSB_TRACK_BAK_FILE for restore_lsb_release.
+patch_lsb_release() {
+  local lsb=/etc/lsb-release
+
+  # Nothing to do if already patched (e.g. server was restarted without stop).
+  if grep -q 'testimage-channel' "$lsb" 2>/dev/null; then
+    return 0
+  fi
+
+  remount_rootfs_rw
+
+  local orig
+  orig=$(grep '^CHROMEOS_RELEASE_TRACK=' "$lsb" 2>/dev/null | cut -d= -f2)
+  if [[ -z "$orig" ]]; then
+    warn "CHROMEOS_RELEASE_TRACK not found in $lsb — skipping patch"
+    return 1
+  fi
+
+  echo "$orig" > "$LSB_TRACK_BAK_FILE"
+  sed -i 's/^CHROMEOS_RELEASE_TRACK=.*/CHROMEOS_RELEASE_TRACK=testimage-channel/' "$lsb" \
+    || { warn "Failed to patch $lsb"; return 1; }
+
+  ok "lsb-release: CHROMEOS_RELEASE_TRACK patched (was: $orig)"
+}
+
+# restore_lsb_release — undo the patch_lsb_release change.
+restore_lsb_release() {
+  local lsb=/etc/lsb-release
+
+  [[ -f "$LSB_TRACK_BAK_FILE" ]] || return 0
+
+  local orig; orig=$(cat "$LSB_TRACK_BAK_FILE")
+  if [[ -z "$orig" ]]; then
+    rm -f "$LSB_TRACK_BAK_FILE"; return 0
+  fi
+
+  remount_rootfs_rw
+  sed -i "s/^CHROMEOS_RELEASE_TRACK=.*/CHROMEOS_RELEASE_TRACK=$orig/" "$lsb" \
+    && ok "lsb-release: CHROMEOS_RELEASE_TRACK restored to $orig"
+  rm -f "$LSB_TRACK_BAK_FILE"
+}
 
 dm_server_running() {
   [[ -f "$DM_PID_FILE" ]] || return 1
@@ -208,6 +263,11 @@ start_dm_server() {
   # enrollment-blocking flags are all present before touching the DM URL.
   setup_chrome_conf
 
+  # Patch lsb-release so Chrome does not crash when it processes
+  # --disable-policy-key-verification (which calls CrashIfChromeOSNonTestImage,
+  # which aborts unless CHROMEOS_RELEASE_TRACK contains testimage-channel).
+  patch_lsb_release || die "Could not patch lsb-release — cannot start DM server safely"
+
   # Snapshot whether the DM block already existed BEFORE we rewrite it.
   # If it was already there Chrome already knows our server address (same
   # fixed port) — a UI restart is not needed.
@@ -237,6 +297,7 @@ stop_dm_server() {
   rm -f "$DM_PID_FILE" "$DM_PORT_FILE"
   remove_dm_url
   ok "Removed DM URL from chrome_dev.conf."
+  restore_lsb_release
   warn "Restarting UI..."
   sleep 1; restart_ui
 }
@@ -354,18 +415,24 @@ for k, v in sorted(d.items()):
 }
 
 # ── import from chrome://policy export ───────────────────────────────────────
-EXPORT_FILENAME="policy_export.json"
-EXPORT_SEARCH=(
-  "/home/chronos/user/Downloads"
-  "/home/chronos/user/MyFiles/Downloads"
-  "/home/chronos/user/MyFiles"
-  "/home/chronos/user"
-)
 
+# find_policy_export — locate the most recently written chrome://policy export
+# file in the standard ChromeOS download locations.
+#
+# Chrome exports the file as "policies_export.json" (plural, Chrome 129+) or
+# "policy_export.json" (older). We search for both with a glob and pick the
+# newest, matching the approach used by modmium/grabpolicy.
 find_policy_export() {
-  for dir in "${EXPORT_SEARCH[@]}"; do
-    [[ -f "$dir/$EXPORT_FILENAME" ]] && echo "$dir/$EXPORT_FILENAME" && return
-  done
+  find \
+    /home/user/*/MyFiles/Downloads/ \
+    /home/chronos/user/Downloads/ \
+    /home/chronos/user/MyFiles/Downloads/ \
+    /home/chronos/user/MyFiles/ \
+    /home/chronos/user/ \
+    -maxdepth 1 \
+    \( -name "policies_*" -o -name "policy_export.json" \) \
+    -type f -printf "%T@ %p\n" 2>/dev/null \
+  | sort -rn | head -1 | cut -d' ' -f2-
 }
 
 do_local_import() {
@@ -378,14 +445,14 @@ do_local_import() {
   export_file=$(find_policy_export)
 
   if [[ -z "$export_file" ]]; then
-    warn "No export file found (looking for '$EXPORT_FILENAME' in Downloads)."
+    warn "No export file found in Downloads."
     echo ""
     info "How to export:"
     echo "  1. Open the browser and go to chrome://policy"
     echo "  2. Click the 'Export to JSON' button at the top"
-    echo "  3. Save the file as:  policy_export.json"
-    echo "  4. Save it to your Downloads folder"
-    echo "  5. Come back to VT2 (Ctrl+Alt+F2) and try again"
+    echo "  3. Save the file to your Downloads folder"
+    echo "     (Chrome saves it as 'policies_export.json' or 'policy_export.json')"
+    echo "  4. Come back to VT2 (Ctrl+Alt+F2) and try again"
     echo ""
     echo -e "${D}Press Enter...${N}"
     read -r; disallow_input; return
@@ -405,9 +472,8 @@ with open(export_path) as f:
 
 user_policies = {}
 
-# Format 1: newer Chrome — top-level keys are policy names
-# { "PolicyName": { "value": ..., "scope": "User", ... }, ... }
-# Sometimes wrapped under "chromePolicies"
+# Format 1: newer Chrome — top-level keys are policy names, each with
+# { "value": ..., "scope": "User", ... }. Sometimes wrapped under "chromePolicies".
 def extract_from_flat(d):
     out = {}
     for name, info in d.items():
@@ -431,7 +497,8 @@ else:
     user_policies = extract_from_flat(export)
 
 if not user_policies:
-    # Last resort: grab everything with a value field regardless of scope
+    # Last resort: grab everything with a value field regardless of scope.
+    # Emit WARN: so the caller can surface this to the user.
     def extract_all(d):
         out = {}
         for name, info in d.items():
@@ -445,8 +512,36 @@ if not user_policies:
         user_policies = extract_all(chrome.get('policies', {}))
     else:
         user_policies = extract_all(export)
-    if user_policies:
-        print(f"WARNING: no user-scoped policies found; imported all {len(user_policies)} policies")
+    if not user_policies:
+        print("ERROR: no policies could be extracted — unexpected export format", file=sys.stderr)
+        sys.exit(1)
+    # Write then signal caller with WARN:count:message (single line).
+    with open(out_path, 'w') as f:
+        json.dump(user_policies, f, indent=2)
+    print(f"WARN:{len(user_policies)}:no user-scoped policies found; imported all without scope filter — review before applying")
+    sys.exit(0)
+
+# ── ExtensionInstallForcelist → ExtensionSettings ─────────────────────────
+# The DM protocol serves extension force-installs via ExtensionSettings, not
+# ExtensionInstallForcelist. Convert any entries that came from the export so
+# dm_server.py serves them in the form Chrome's extension system expects.
+if "ExtensionInstallForcelist" in user_policies:
+    force_list = user_policies.pop("ExtensionInstallForcelist")
+    ext_settings = dict(user_policies.get("ExtensionSettings") or {})
+    for entry in (force_list or []):
+        entry = str(entry)
+        if ";" in entry:
+            ext_id, update_url = entry.split(";", 1)
+        else:
+            ext_id = entry
+            update_url = "https://clients2.google.com/service/update2/crx"
+        ext_id = ext_id.strip()
+        ext_settings.setdefault(ext_id, {}).update({
+            "installation_mode": "normal_installed",
+            "update_url": update_url.strip(),
+        })
+    if ext_settings:
+        user_policies["ExtensionSettings"] = ext_settings
 
 with open(out_path, 'w') as f:
     json.dump(user_policies, f, indent=2)
@@ -459,12 +554,16 @@ PYEOF
     local count="${result#OK:}"
     ok "Imported $count policies → $upf"
     [[ "$count" -eq 0 ]] && warn "File is empty — the export may have had no user policies."
-  elif [[ "$result" == WARNING:* ]]; then
-    warn "$result"
+  elif [[ "$result" == WARN:* ]]; then
+    local rest="${result#WARN:}"
+    local count="${rest%%:*}"
+    local msg="${rest#*:}"
+    ok "Imported $count policies → $upf"
+    warn "  ↳ $msg"
     warn "Review the file before applying."
   else
     warn "Import failed. The export file may be in an unexpected format."
-    warn "Try editing user_policies.json manually instead."
+    warn "Try editing $(basename "$upf") manually instead."
   fi
 
   echo ""
